@@ -2,12 +2,13 @@ from pathlib import Path
 
 import pytest
 from IPython.core.error import UsageError
-from IPython.testing.globalipapp import get_ipython
 
+import kedro.ipython
 from kedro.framework.project import pipelines
-from kedro.framework.startup import ProjectMetadata
 from kedro.ipython import (
     _find_node,
+    _format_node_inputs_text,
+    _get_node_bound_arguments,
     _load_node,
     _prepare_function_body,
     _prepare_imports,
@@ -17,134 +18,9 @@ from kedro.ipython import (
     magic_load_node,
     reload_kedro,
 )
-from kedro.pipeline import node
 from kedro.pipeline.modular_pipeline import pipeline as modular_pipeline
 
-PACKAGE_NAME = "fake_package_name"
-PROJECT_NAME = "fake_project_name"
-PROJECT_INIT_VERSION = "0.1"
-
-
-@pytest.fixture(autouse=True)
-def cleanup_pipeline():
-    yield
-    from kedro.framework.project import pipelines
-
-    pipelines.configure()
-
-
-@pytest.fixture(scope="module", autouse=True)  # get_ipython() twice will result in None
-def ipython():
-    ipython = get_ipython()
-    load_ipython_extension(ipython)
-    return ipython
-
-
-@pytest.fixture(autouse=True)
-def fake_metadata(tmp_path):
-    metadata = ProjectMetadata(
-        source_dir=tmp_path / "src",  # default
-        config_file=tmp_path / "pyproject.toml",
-        package_name=PACKAGE_NAME,
-        project_name=PROJECT_NAME,
-        kedro_init_version=PROJECT_INIT_VERSION,
-        project_path=tmp_path,
-        tools=None,
-        example_pipeline=None,
-    )
-    return metadata
-
-
-@pytest.fixture(autouse=True)
-def mock_kedro_project(mocker, fake_metadata):
-    mocker.patch("kedro.ipython.bootstrap_project", return_value=fake_metadata)
-    mocker.patch("kedro.ipython.configure_project")
-    mocker.patch("kedro.ipython.KedroSession.create")
-
-
-def dummy_function(dummy_input, my_input):
-    """
-    Returns True if input is not
-    """
-    # this is an in-line comment in the body of the function
-    random_assignment = "Added for a longer function"
-    random_assignment += "make sure to modify variable"
-    return not dummy_input
-
-
-@pytest.fixture
-def dummy_function_defintion():
-    body = '''def dummy_function(dummy_input, my_input):
-    """
-    Returns True if input is not
-    """
-    # this is an in-line comment in the body of the function
-    random_assignment = "Added for a longer function"
-    random_assignment += "make sure to modify variable"
-    return not dummy_input
-'''
-    return body
-
-
-def dummy_nested_function(dummy_input):
-    def nested_function(input):
-        return not input
-
-    return nested_function(dummy_input)
-
-
-def dummy_function_with_loop(dummy_list):
-    for x in dummy_list:
-        continue
-    return len(dummy_list)
-
-
-@pytest.fixture
-def dummy_node():
-    return node(
-        func=dummy_function,
-        inputs=["dummy_input", "extra_input"],
-        outputs=["dummy_output"],
-        name="dummy_node",
-    )
-
-
-@pytest.fixture
-def lambda_node():
-    return node(
-        func=lambda x: x,
-        inputs=[
-            "x",
-        ],
-        outputs=["lambda_output"],
-        name="lambda_node",
-    )
-
-
-@pytest.fixture
-def dummy_function_file_lines():
-    # string representation of a dummy function includes imports, comments, and a
-    # file function
-    file_lines = """This is a multi-line comment at the top of the file
-It serves as an explanation for the contents of the file ''
-import package1
-from package2 import module1
-# this is a comment about the next import
-import package3 as pkg3
-def my_func:,
-# import here for performance from package4.module2 import class1
-# this is an in-line comment in the body of the function
-'random_assignment = Added for a longer function'
-'random_assignment += make sure to modify variable'
-return not dummy_input
-import package5.module3"""
-    return file_lines
-
-
-@pytest.fixture
-def dummy_pipelines(dummy_node):
-    # return a dict of pipelines
-    return {"dummy_pipeline": modular_pipeline([dummy_node])}
+from .conftest import dummy_function, dummy_function_with_loop, dummy_nested_function
 
 
 class TestLoadKedroObjects:
@@ -396,7 +272,7 @@ class TestProjectPathResolution:
 
 
 class TestLoadNodeMagic:
-    def test_load_node_magic(self, mocker, dummy_function_file_lines, dummy_pipelines):
+    def test_load_node_magic(self, mocker, dummy_module_literal, dummy_pipelines):
         # Reimport `pipelines` from `kedro.framework.project` to ensure that
         # it was not removed by prior tests.
         from kedro.framework.project import pipelines
@@ -404,9 +280,6 @@ class TestLoadNodeMagic:
         # Mocking setup
         mock_jupyter_console = mocker.MagicMock()
         mocker.patch("ipylab.JupyterFrontEnd", mock_jupyter_console)
-        mocker.patch(
-            "builtins.open", mocker.mock_open(read_data=dummy_function_file_lines)
-        )
         mock_pipeline_values = dummy_pipelines.values()
         mocker.patch.object(pipelines, "values", return_value=mock_pipeline_values)
 
@@ -416,14 +289,10 @@ class TestLoadNodeMagic:
     def test_load_node(
         self,
         mocker,
-        dummy_function_file_lines,
         dummy_function_defintion,
         dummy_pipelines,
     ):
         # wraps all the other functions
-        mocker.patch(
-            "builtins.open", mocker.mock_open(read_data=dummy_function_file_lines)
-        )
         mock_pipeline_values = dummy_pipelines.values()
         mocker.patch.object(pipelines, "values", return_value=mock_pipeline_values)
 
@@ -432,10 +301,10 @@ class TestLoadNodeMagic:
 dummy_input = catalog.load("dummy_input")
 my_input = catalog.load("extra_input")"""
 
-        node_imports = """import package1
-from package2 import module1
-import package3 as pkg3
-import package5.module3"""
+        node_imports = """import logging  # noqa
+from logging import config  # noqa
+import logging as dummy_logging  # noqa
+import logging.config  # noqa Dummy import"""
 
         node_func_definition = dummy_function_defintion
         node_func_call = "dummy_function(dummy_input, my_input)"
@@ -469,15 +338,11 @@ import package5.module3"""
             in str(excinfo.value)
         )
 
-    def test_prepare_imports(self, mocker, dummy_function_file_lines):
-        mocker.patch(
-            "builtins.open", mocker.mock_open(read_data=dummy_function_file_lines)
-        )
-
-        func_imports = """import package1
-from package2 import module1
-import package3 as pkg3
-import package5.module3"""
+    def test_prepare_imports(self, mocker, dummy_module_literal):
+        func_imports = """import logging  # noqa
+from logging import config  # noqa
+import logging as dummy_logging  # noqa
+import logging.config  # noqa Dummy import"""
 
         result = _prepare_imports(dummy_function)
         assert result == func_imports
@@ -494,13 +359,48 @@ import package5.module3"""
         self,
         dummy_node,
     ):
-        func_inputs = """# Prepare necessary inputs for debugging
-# All debugging inputs must be defined in your project catalog
-dummy_input = catalog.load("dummy_input")
-my_input = catalog.load("extra_input")"""
+        expected = {"dummy_input": "dummy_input", "my_input": "extra_input"}
 
-        result = _prepare_node_inputs(dummy_node)
-        assert result == func_inputs
+        node_bound_arguments = _get_node_bound_arguments(dummy_node)
+        result = _prepare_node_inputs(node_bound_arguments)
+        assert result == expected
+
+    def test_prepare_node_inputs_when_input_is_empty(
+        self,
+        dummy_node_empty_input,
+    ):
+        expected = {"dummy_input": "", "my_input": ""}
+
+        node_bound_arguments = _get_node_bound_arguments(dummy_node_empty_input)
+        result = _prepare_node_inputs(node_bound_arguments)
+        assert result == expected
+
+    def test_prepare_node_inputs_with_dict_input(
+        self,
+        dummy_node_dict_input,
+    ):
+        expected = {"dummy_input": "dummy_input", "my_input": "extra_input"}
+
+        node_bound_arguments = _get_node_bound_arguments(dummy_node_dict_input)
+        result = _prepare_node_inputs(node_bound_arguments)
+        assert result == expected
+
+    def test_prepare_node_inputs_with_variable_length_args(
+        self,
+        dummy_node_with_variable_length,
+    ):
+        expected = {
+            "dummy_input": "dummy_input",
+            "my_input": "extra_input",
+            "first": "first",
+            "second": "second",
+        }
+
+        node_bound_arguments = _get_node_bound_arguments(
+            dummy_node_with_variable_length
+        )
+        result = _prepare_node_inputs(node_bound_arguments)
+        assert result == expected
 
     def test_prepare_function_body(self, dummy_function_defintion):
         result = _prepare_function_body(dummy_function)
@@ -511,23 +411,97 @@ my_input = catalog.load("extra_input")"""
         result = _prepare_function_body(lambda_node.func)
         assert result == "func=lambda x: x\n"
 
-    def test_get_nested_function_body(self):
-        func_strings = """def dummy_nested_function(dummy_input):
-    def nested_function(input):
-        return not input
-
-    return nested_function(dummy_input)
-"""
-
+    def test_get_nested_function_body(self, dummy_nested_function_literal):
         result = _prepare_function_body(dummy_nested_function)
-        assert result == func_strings
+        assert result == dummy_nested_function_literal
 
-    def test_get_function_with_loop_body(self):
-        func_strings = """def dummy_function_with_loop(dummy_list):
-    for x in dummy_list:
-        continue
-    return len(dummy_list)
-"""
-
+    def test_get_function_with_loop_body(self, dummy_function_with_loop_literal):
         result = _prepare_function_body(dummy_function_with_loop)
-        assert result == func_strings
+        assert result == dummy_function_with_loop_literal
+
+    def test_load_node_magic_with_valid_arguments(self, mocker, ipython):
+        mocker.patch("kedro.ipython._find_kedro_project")
+        mocker.patch("kedro.ipython._load_node")
+        ipython.magic("load_node dummy_node")
+
+    def test_load_node_with_invalid_arguments(self, mocker, ipython):
+        mocker.patch("kedro.ipython._find_kedro_project")
+        mocker.patch("kedro.ipython._load_node")
+        load_ipython_extension(ipython)
+
+        with pytest.raises(
+            UsageError, match=r"unrecognized arguments: --invalid_arg=dummy_node"
+        ):
+            ipython.magic("load_node --invalid_arg=dummy_node")
+
+    def test_load_node_with_jupyter(self, mocker, ipython):
+        mocker.patch("kedro.ipython._find_kedro_project")
+        mocker.patch("kedro.ipython._load_node", return_value=["cell1", "cell2"])
+        mocker.patch("kedro.ipython._guess_run_environment", return_value="jupyter")
+        spy = mocker.spy(kedro.ipython, "_create_cell_with_text")
+        call = mocker.call
+
+        load_ipython_extension(ipython)
+        ipython.magic("load_node dummy_node")
+        calls = [call("cell1", is_jupyter=True), call("cell2", is_jupyter=True)]
+        spy.assert_has_calls(calls)
+
+    @pytest.mark.parametrize("run_env", ["ipython", "vscode"])
+    def test_load_node_with_ipython(self, mocker, ipython, run_env):
+        mocker.patch("kedro.ipython._find_kedro_project")
+        mocker.patch("kedro.ipython._load_node", return_value=["cell1", "cell2"])
+        mocker.patch("kedro.ipython._guess_run_environment", return_value=run_env)
+        spy = mocker.spy(kedro.ipython, "_create_cell_with_text")
+
+        load_ipython_extension(ipython)
+        ipython.magic("load_node dummy_node")
+        spy.assert_called_once()
+
+    @pytest.mark.parametrize("run_env", ["databricks", "colab", "dummy"])
+    def test_load_node_with_other(self, mocker, ipython, run_env):
+        mocker.patch("kedro.ipython._find_kedro_project")
+        mocker.patch("kedro.ipython._load_node", return_value=["cell1", "cell2"])
+        mocker.patch("kedro.ipython._guess_run_environment", return_value=run_env)
+        spy = mocker.spy(kedro.ipython, "_print_cells")
+
+        load_ipython_extension(ipython)
+        ipython.magic("load_node dummy_node")
+        spy.assert_called_once()
+
+
+class TestFormatNodeInputsText:
+    def test_format_node_inputs_text_empty_input(self):
+        # Test with empty input_params_dict
+        input_params_dict = {}
+        expected_output = None
+        assert _format_node_inputs_text(input_params_dict) == expected_output
+
+    def test_format_node_inputs_text_single_input(self):
+        # Test with a single input
+        input_params_dict = {"input1": "dataset1"}
+        expected_output = (
+            "# Prepare necessary inputs for debugging\n"
+            "# All debugging inputs must be defined in your project catalog\n"
+            'input1 = catalog.load("dataset1")'
+        )
+        assert _format_node_inputs_text(input_params_dict) == expected_output
+
+    def test_format_node_inputs_text_multiple_inputs(self):
+        # Test with multiple inputs
+        input_params_dict = {
+            "input1": "dataset1",
+            "input2": "dataset2",
+            "input3": "dataset3",
+        }
+        expected_output = (
+            "# Prepare necessary inputs for debugging\n"
+            "# All debugging inputs must be defined in your project catalog\n"
+            'input1 = catalog.load("dataset1")\n'
+            'input2 = catalog.load("dataset2")\n'
+            'input3 = catalog.load("dataset3")'
+        )
+        assert _format_node_inputs_text(input_params_dict) == expected_output
+
+    def test_format_node_inputs_text_no_catalog_load(self):
+        # Test with no catalog.load() statements if input_params_dict is None
+        assert _format_node_inputs_text(None) is None
